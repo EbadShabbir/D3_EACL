@@ -3,3 +3,5 @@ datasets
 pandas
 numpy 
 scipy
+sentence-transformers
+torch
