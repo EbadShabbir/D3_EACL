@@ -1,0 +1,2 @@
+run,n_questions,n_scored,spearman_rho_Dq_vs_difficulty,spearman_p_value,mean_D_q,hard_case_rate,agent_r_accuracy,agent_d_accuracy,agent_c_accuracy,ensemble_accuracy
+heterogeneous_qwen_r_c_mistral_d,300,300,-0.005434944788446638,0.9253127477120283,0.535689115171079,0.91,0.25333333333333335,0.22666666666666666,0.47333333333333333,0.4066666666666667

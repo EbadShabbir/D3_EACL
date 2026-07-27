@@ -1,0 +1,72 @@
+# Operating-system and editor files
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Python caches and local environments
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+.venv/
+venv/
+env/
+
+# Jupyter
+.ipynb_checkpoints/
+
+# Secrets and local configuration
+.env
+.env.*
+!.env.example
+*.key
+*.pem
+
+# Logs and experiment trackers
+*.log
+wandb/
+runs/
+
+# Model checkpoints and generated archives
+*.bin
+*.ckpt
+*.onnx
+*.pt
+*.pth
+*.safetensors
+*.tar
+*.tar.gz
+*.tgz
+*.zip
+qwen-model/
+checkpoints/
+
+# Generated experiment bundles and scratch outputs
+/co_evolution/outputs*/
+/experiments/experiment_0/kaggle_same_family_bundle/
+
+# Raw downloaded data; retain the prepared research subsets instead
+/data_preparation/kaggle_gpqa_raw/
+
+# This legacy notebook contains local authentication state. Use the script or
+# create a sanitized notebook before adding it to Git.
+/agents/agent_d/agent-d.ipynb
+/agents/agent_d/download.txt
+
+# Generated documents and private local material
+*.docx
+*.pdf
+
+# Unrelated local portfolio project
+/portfolio/
+
+# JavaScript dependencies/build output if a web tool is added later
+node_modules/
+dist/

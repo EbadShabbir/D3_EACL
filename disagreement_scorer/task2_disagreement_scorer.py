@@ -1,116 +1,236 @@
 """
-TASK 2 — Disagreement Scorer Module + 4 Unit Tests
-Run in: VS Code / local
-Install first: pip install sentence-transformers numpy scipy torch
+TASK 2 - Disagreement Scorer Module
+
+Multiple-choice disagreement scorer:
+  D_answer       = normalized entropy over chosen answers
+  D_distribution = mean pairwise Jensen-Shannon divergence over answer distributions
+  D_confidence   = normalized variance(confidence)
+  D_correctness  = optional correctness-weighted disagreement signal
+  D(q)           = weighted mixture of the above
+
+For agents that only return a selected answer and scalar confidence, we build a
+small option distribution by placing confidence mass on the selected answer and
+spreading the remaining mass across the other options. If logits/probabilities
+are available later, pass them through AgentOutput.probs.
 """
 
-import json
-import numpy as np
-from dataclasses import dataclass, field
-from typing import List, Dict, Optional
 from collections import deque
-from sentence_transformers import SentenceTransformer
-from scipy.spatial.distance import cosine
+from dataclasses import dataclass
+import math
+from typing import Dict, List, Optional
 
-# ── Load sentence encoder once (reused across all calls) ─────────────────────
-print("Loading sentence encoder...")
-ENCODER = SentenceTransformer("all-MiniLM-L6-v2")
-print("Encoder loaded.\n")
+import numpy as np
 
-
-# ── Data Structures ───────────────────────────────────────────────────────────
 
 @dataclass
 class AgentOutput:
-    """Output from a single agent for one question."""
-    agent_name: str        # "R", "D", or "C"
-    answer:     str        # The answer text
-    confidence: float      # Float in [0, 1]
+    """Output from one agent on one multiple-choice question."""
+
+    agent_name: str
+    answer: str
+    confidence: float
+    probs: Optional[Dict[str, float]] = None
 
 
 @dataclass
 class DisagreementResult:
-    """Full result for one question."""
-    question_id:    str
-    question:       str
-    agent_outputs:  List[AgentOutput]
-    d_semantic:     float   # Semantic distance component
-    d_confidence:   float   # Confidence variance component
-    d_score:        float   # Final D(q) = 0.6 * semantic + 0.4 * confidence
-    is_hard_case:   bool    # True if D(q) > threshold
+    """Full scored result for one question."""
 
+    question_id: str
+    question: str
+    agent_outputs: List[AgentOutput]
+    d_answer: float
+    d_confidence: float
+    d_score: float
+    is_hard_case: bool
+    d_distribution: float = 0.0
+    d_correctness: float = 0.0
 
-# ── Core Disagreement Scorer ──────────────────────────────────────────────────
+    @property
+    def d_semantic(self) -> float:
+        """Backward-compatible alias used by older Experiment 0 scripts."""
+        return self.d_answer
+
 
 class DisagreementScorer:
-    """
-    Computes D(q) for a question given outputs from 3 agents.
+    """Compute D(q) from answer entropy, JS divergence, confidence, and correctness."""
 
-    D(q) = 0.6 * D_semantic(q) + 0.4 * D_confidence(q)
-
-    D_semantic:   mean pairwise cosine distance between answer embeddings
-    D_confidence: variance of the three confidence scores
-    """
-
-    def __init__(self, threshold: float = 0.5):
+    def __init__(
+        self,
+        threshold: float = 0.5,
+        adaptive_percentile: Optional[float] = None,
+        answer_weight: float = 0.45,
+        distribution_weight: float = 0.35,
+        confidence_weight: float = 0.15,
+        correctness_weight: float = 0.05,
+        num_options: int = 4,
+        epsilon: float = 1e-12,
+    ):
         self.threshold = threshold
-        self.encoder   = ENCODER
+        self.adaptive_percentile = adaptive_percentile
+        self.answer_weight = answer_weight
+        self.distribution_weight = distribution_weight
+        self.confidence_weight = confidence_weight
+        self.correctness_weight = correctness_weight
+        self.num_options = num_options
+        self.epsilon = epsilon
 
-    def _embed(self, texts: List[str]) -> np.ndarray:
-        """Embed a list of texts, returns (N, dim) array."""
-        return self.encoder.encode(texts, convert_to_numpy=True)
+        total = (
+            answer_weight
+            + distribution_weight
+            + confidence_weight
+            + correctness_weight
+        )
+        if total <= 0:
+            raise ValueError("At least one disagreement weight must be positive.")
+        self._weight_total = total
 
-    def _semantic_distance(self, answers: List[str]) -> float:
-        """
-        Mean pairwise cosine distance across the 3 agent answers.
-        cosine distance = 1 - cosine similarity, range [0, 1].
-        """
-        embeddings = self._embed(answers)
-        n = len(embeddings)
-        distances = []
-        for i in range(n):
-            for j in range(i + 1, n):
-                dist = cosine(embeddings[i], embeddings[j])
-                distances.append(dist)
-        return float(np.mean(distances))
+    @staticmethod
+    def _normalize_answer(answer: str) -> str:
+        text = str(answer).strip().upper()
+        if not text:
+            return ""
+        if text[0].isalpha():
+            return text[0]
+        return text
+
+    def _answer_disagreement(self, answers: List[str]) -> float:
+        """Backward-compatible binary disagreement."""
+        normalized = [self._normalize_answer(answer) for answer in answers]
+        return 0.0 if len(set(normalized)) == 1 else 1.0
+
+    def _answer_entropy(self, answers: List[str]) -> float:
+        normalized = [self._normalize_answer(answer) for answer in answers]
+        counts = np.asarray(
+            [normalized.count(answer) for answer in sorted(set(normalized))],
+            dtype=float,
+        )
+        probs = counts / max(float(len(normalized)), 1.0)
+        entropy = -float(np.sum(probs * np.log(probs + self.epsilon)))
+        max_entropy = math.log(min(len(normalized), self.num_options))
+        if max_entropy <= 0:
+            return 0.0
+        return float(np.clip(entropy / max_entropy, 0.0, 1.0))
 
     def _confidence_variance(self, confidences: List[float]) -> float:
-        """
-        Variance of confidence scores, normalized to [0, 1].
-        Max variance for 3 values in [0,1] is 1/3 (e.g. 0, 0.5, 1).
-        We normalize by dividing by max possible variance.
-        """
-        var = float(np.var(confidences))
-        max_var = 1 / 3  # theoretical max for 3 values in [0,1]
-        return min(var / max_var, 1.0)
+        clipped = np.clip(np.asarray(confidences, dtype=float), 0.0, 1.0)
+        var = float(np.var(clipped))
+        max_var = 1.0 / 3.0
+        return float(np.clip(var / max_var, 0.0, 1.0))
+
+    def _option_labels(self, outputs: List[AgentOutput]) -> List[str]:
+        labels = set()
+        for output in outputs:
+            labels.add(self._normalize_answer(output.answer))
+            if output.probs:
+                labels.update(self._normalize_answer(option) for option in output.probs)
+
+        canonical = [chr(ord("A") + i) for i in range(self.num_options)]
+        labels.update(canonical)
+        return sorted(label for label in labels if label)
+
+    def _distribution_for_output(
+        self,
+        output: AgentOutput,
+        labels: List[str],
+    ) -> np.ndarray:
+        if output.probs:
+            raw = np.asarray(
+                [
+                    max(float(output.probs.get(label, output.probs.get(label.lower(), 0.0))), 0.0)
+                    for label in labels
+                ],
+                dtype=float,
+            )
+            total = float(np.sum(raw))
+            if total > 0:
+                return raw / total
+
+        chosen = self._normalize_answer(output.answer)
+        confidence = float(np.clip(output.confidence, 0.0, 1.0))
+        dist = np.zeros(len(labels), dtype=float)
+        if chosen in labels:
+            chosen_idx = labels.index(chosen)
+            dist[chosen_idx] = confidence
+            other_count = max(len(labels) - 1, 1)
+            spill = (1.0 - confidence) / other_count
+            for idx in range(len(labels)):
+                if idx != chosen_idx:
+                    dist[idx] = spill
+        else:
+            dist[:] = 1.0 / len(labels)
+        return dist / max(float(np.sum(dist)), self.epsilon)
+
+    def _js_divergence(self, p: np.ndarray, q: np.ndarray) -> float:
+        m = 0.5 * (p + q)
+        kl_pm = float(np.sum(p * np.log((p + self.epsilon) / (m + self.epsilon))))
+        kl_qm = float(np.sum(q * np.log((q + self.epsilon) / (m + self.epsilon))))
+        js = 0.5 * (kl_pm + kl_qm)
+        return float(np.clip(js / math.log(2), 0.0, 1.0))
+
+    def _distribution_disagreement(self, outputs: List[AgentOutput]) -> float:
+        labels = self._option_labels(outputs)
+        distributions = [self._distribution_for_output(output, labels) for output in outputs]
+        divergences = []
+        for i in range(len(distributions)):
+            for j in range(i + 1, len(distributions)):
+                divergences.append(self._js_divergence(distributions[i], distributions[j]))
+        if not divergences:
+            return 0.0
+        return float(np.clip(np.mean(divergences), 0.0, 1.0))
+
+    def _correctness_disagreement(
+        self,
+        outputs: List[AgentOutput],
+        correct_answer: Optional[str],
+    ) -> float:
+        if correct_answer is None:
+            return 0.0
+        correct = self._normalize_answer(correct_answer)
+        correctness = [
+            1.0 if self._normalize_answer(output.answer) == correct else 0.0
+            for output in outputs
+        ]
+        return 0.0 if len(set(correctness)) == 1 else 1.0
 
     def score(
         self,
         question_id: str,
-        question:    str,
-        outputs:     List[AgentOutput],
+        question: str,
+        outputs: List[AgentOutput],
+        correct_answer: Optional[str] = None,
     ) -> DisagreementResult:
-        """
-        Compute D(q) for one question given 3 agent outputs.
-        """
-        assert len(outputs) == 3, "Exactly 3 agent outputs required."
+        if len(outputs) != 3:
+            raise ValueError("Need exactly 3 agent outputs.")
 
-        answers     = [o.answer     for o in outputs]
+        answers = [o.answer for o in outputs]
         confidences = [o.confidence for o in outputs]
 
-        d_semantic    = self._semantic_distance(answers)
-        d_confidence  = self._confidence_variance(confidences)
-        d_score       = round(0.6 * d_semantic + 0.4 * d_confidence, 4)
-        is_hard_case  = d_score > self.threshold
+        d_answer = self._answer_entropy(answers)
+        d_distribution = self._distribution_disagreement(outputs)
+        d_conf = self._confidence_variance(confidences)
+        d_correctness = self._correctness_disagreement(outputs, correct_answer)
+        d_q = round(
+            (
+                self.answer_weight * d_answer
+                + self.distribution_weight * d_distribution
+                + self.confidence_weight * d_conf
+                + self.correctness_weight * d_correctness
+            )
+            / self._weight_total,
+            4,
+        )
 
         return DisagreementResult(
-            question_id   = question_id,
-            question      = question,
-            agent_outputs = outputs,
-            d_semantic    = round(d_semantic, 4),
-            d_confidence  = round(d_confidence, 4),
-            d_score       = d_score,
-            is_hard_case  = is_hard_case,
+            question_id=question_id,
+            question=question,
+            agent_outputs=outputs,
+            d_answer=round(d_answer, 4),
+            d_confidence=round(d_conf, 4),
+            d_score=d_q,
+            is_hard_case=d_q > self.threshold,
+            d_distribution=round(d_distribution, 4),
+            d_correctness=round(d_correctness, 4),
         )
 
     def score_batch(
@@ -118,29 +238,27 @@ class DisagreementScorer:
         questions: List[Dict],
         outputs_per_question: List[List[AgentOutput]],
     ) -> List[DisagreementResult]:
-        """Score a batch of questions."""
-        results = []
-        for q, outputs in zip(questions, outputs_per_question):
-            result = self.score(
-                question_id = q["question_id"],
-                question    = q["question"],
-                outputs     = outputs,
+        results = [
+            self.score(
+                q["question_id"],
+                q["question"],
+                outputs,
+                correct_answer=q.get("answer") or q.get("correct_answer"),
             )
-            results.append(result)
+            for q, outputs in zip(questions, outputs_per_question)
+        ]
+        if self.adaptive_percentile is not None and results:
+            scores = np.asarray([result.d_score for result in results], dtype=float)
+            adaptive_threshold = float(np.percentile(scores, self.adaptive_percentile))
+            for result in results:
+                result.is_hard_case = result.d_score >= adaptive_threshold
         return results
 
 
-# ── Hard Case Buffer ──────────────────────────────────────────────────────────
-# (Full implementation is Task 3 — this is a minimal version needed for tests)
-
 class HardCaseBuffer:
-    """
-    Rolling FIFO buffer of hard cases. Max 500 entries.
-    Used by the co-evolution loop in Task 10.
-    """
+    """Minimal rolling FIFO buffer retained for Task 2 standalone use."""
 
     def __init__(self, max_size: int = 500):
-        self.max_size = max_size
         self.buffer: deque = deque(maxlen=max_size)
 
     def add(self, result: DisagreementResult):
@@ -148,140 +266,64 @@ class HardCaseBuffer:
             self.buffer.append(result)
 
     def top_k(self, k: int = 200) -> List[DisagreementResult]:
-        """Return top-k by D(q) score."""
-        sorted_buf = sorted(self.buffer, key=lambda x: x.d_score, reverse=True)
-        return sorted_buf[:k]
+        return sorted(self.buffer, key=lambda x: x.d_score, reverse=True)[:k]
 
     def __len__(self):
         return len(self.buffer)
 
 
-# ── 4 Unit Tests ─────────────────────────────────────────────────────────────
-
-def run_unit_tests():
+def run_unit_tests() -> bool:
     scorer = DisagreementScorer(threshold=0.5)
     results = []
 
     print("=" * 60)
-    print("RUNNING 4 UNIT TESTS")
+    print("RUNNING TASK 2 UNIT TESTS")
     print("=" * 60)
 
-    # ── TEST 1: Identical answers → D(q) < 0.1 ───────────────────────────────
-    print("\nTest 1: Identical answers — expect D(q) < 0.1")
-    identical_outputs = [
-        AgentOutput("R", "The answer is Paris, the capital of France.", 0.9),
-        AgentOutput("D", "The answer is Paris, the capital of France.", 0.9),
-        AgentOutput("C", "The answer is Paris, the capital of France.", 0.9),
-    ]
-    r1 = scorer.score("t1", "What is the capital of France?", identical_outputs)
-    status = "✅ PASS" if r1.d_score < 0.1 else "❌ FAIL"
-    print(f"  D_semantic={r1.d_semantic}, D_confidence={r1.d_confidence}, D(q)={r1.d_score}")
-    print(f"  Expected: < 0.1   →  {status}")
-    results.append(("Test 1 — Identical answers", r1.d_score < 0.1))
+    r1 = scorer.score("t1", "same answer, same confidence", [
+        AgentOutput("R", "A", 0.9),
+        AgentOutput("D", "A", 0.9),
+        AgentOutput("C", "A", 0.9),
+    ])
+    ok1 = r1.d_answer == 0.0 and r1.d_confidence == 0.0 and r1.d_distribution == 0.0 and r1.d_score == 0.0
+    print(f"Test 1 identical outputs: D_answer={r1.d_answer}, D_js={r1.d_distribution}, D_conf={r1.d_confidence}, D={r1.d_score}")
+    results.append(("Identical outputs", ok1))
 
-    # ── TEST 2: Maximal disagreement → D(q) > 0.8 ────────────────────────────
-    print("\nTest 2: Maximal disagreement — expect D(q) > 0.8")
-    maximal_outputs = [
-        AgentOutput("R", "The mitochondria produce ATP through oxidative phosphorylation using the electron transport chain.", 0.95),
-        AgentOutput("D", "The French Revolution began in 1789 due to economic hardship and social inequality among the estates.", 0.90),
-        AgentOutput("C", "Quantum entanglement allows particles to instantaneously affect each other regardless of the distance separating them.", 0.85),
-    ]
-    r2 = scorer.score("t2", "Completely unrelated topics question.", maximal_outputs)
-    status = "✅ PASS" if r2.d_score > 0.8 else "❌ FAIL"
-    print(f"  D_semantic={r2.d_semantic}, D_confidence={r2.d_confidence}, D(q)={r2.d_score}")
-    print(f"  Expected: > 0.8   →  {status}")
-    results.append(("Test 2 — Maximal disagreement", r2.d_score > 0.8))
+    r2 = scorer.score("t2", "answer disagreement", [
+        AgentOutput("R", "A", 0.8),
+        AgentOutput("D", "B", 0.8),
+        AgentOutput("C", "A", 0.8),
+    ])
+    ok2 = 0.55 < r2.d_answer < 0.60 and r2.d_confidence == 0.0 and 0.25 < r2.d_score < 0.45
+    print(f"Test 2 answer disagreement: D_answer={r2.d_answer}, D_js={r2.d_distribution}, D_conf={r2.d_confidence}, D={r2.d_score}")
+    results.append(("Answer disagreement", ok2))
 
-    # ── TEST 3: Same answer, different confidences → 0.1 < D(q) < 0.4 ────────
-    print("\nTest 3: Same answer, confidences 0.9 / 0.5 / 0.1 — expect 0.1 < D(q) < 0.4")
-    conf_only_outputs = [
-        AgentOutput("R", "The boiling point of water is 100 degrees Celsius at standard pressure.", 0.9),
-        AgentOutput("D", "The boiling point of water is 100 degrees Celsius at standard pressure.", 0.5),
-        AgentOutput("C", "The boiling point of water is 100 degrees Celsius at standard pressure.", 0.1),
-    ]
-    r3 = scorer.score("t3", "What is the boiling point of water?", conf_only_outputs)
-    status = "✅ PASS" if 0.1 < r3.d_score < 0.4 else "❌ FAIL"
-    print(f"  D_semantic={r3.d_semantic}, D_confidence={r3.d_confidence}, D(q)={r3.d_score}")
-    print(f"  Expected: 0.1 < D(q) < 0.4   →  {status}")
-    results.append(("Test 3 — Confidence-only disagreement", 0.1 < r3.d_score < 0.4))
+    r3 = scorer.score("t3", "confidence disagreement", [
+        AgentOutput("R", "C", 0.9),
+        AgentOutput("D", "C", 0.5),
+        AgentOutput("C", "C", 0.1),
+    ])
+    ok3 = r3.d_answer == 0.0 and 0.01 < r3.d_score < 0.20
+    print(f"Test 3 confidence variance: D_answer={r3.d_answer}, D_js={r3.d_distribution}, D_conf={r3.d_confidence}, D={r3.d_score}")
+    results.append(("Confidence variance", ok3))
 
-    # ── TEST 4: Hard case flagging on MMLU-Pro sample ────────────────────────
-    print("\nTest 4: Hard case flagging — top quartile of D(q) should overlap with hard questions")
-    try:
-        with open("D:\\Multi_Agent_Code\\Data_prepare_task1\\mmlu_pro_hard_sample_50.json") as f:
-            hard_sample = json.load(f)
+    r4 = scorer.score("t4", "combined disagreement", [
+        AgentOutput("R", "A. Paris", 0.95),
+        AgentOutput("D", "B. London", 0.50),
+        AgentOutput("C", "C. Rome", 0.05),
+    ])
+    ok4 = r4.d_answer > 0.99 and r4.d_score > 0.5 and r4.is_hard_case
+    print(f"Test 4 combined signal: D_answer={r4.d_answer}, D_js={r4.d_distribution}, D_conf={r4.d_confidence}, D={r4.d_score}")
+    results.append(("Combined signal", ok4))
 
-        # Simulate diverse agent outputs for known hard questions
-        # (In reality agents would differ; here we simulate with varied answers)
-        simulated_results = []
-        for q in hard_sample[:20]:
-            opts = q["options"]
-            sim_outputs = [
-                AgentOutput("R", opts[0], 0.4),
-                AgentOutput("D", opts[2], 0.7),
-                AgentOutput("C", opts[1], 0.3),
-            ]
-            res = scorer.score(q["question_id"], q["question"], sim_outputs)
-            simulated_results.append((q["difficulty_score"], res.d_score))
-
-        # Check: correlation between difficulty and D(q) should be positive
-        difficulty_scores = [x[0] for x in simulated_results]
-        d_scores          = [x[1] for x in simulated_results]
-
-        from scipy.stats import spearmanr
-        corr, pval = spearmanr(difficulty_scores, d_scores)
-
-        # Hard cases (top quartile by D(q)) should align with high difficulty
-        d_threshold = np.percentile(d_scores, 75)
-        flagged_as_hard = [i for i, d in enumerate(d_scores) if d >= d_threshold]
-        high_difficulty = [i for i, diff in enumerate(difficulty_scores) if diff >= np.percentile(difficulty_scores, 75)]
-        overlap = len(set(flagged_as_hard) & set(high_difficulty))
-        overlap_ratio = overlap / max(len(flagged_as_hard), 1)
-
-        status = "✅ PASS" if overlap_ratio >= 0.3 else "❌ FAIL"
-        print(f"  Spearman corr(difficulty, D(q)) = {corr:.3f}  (p={pval:.3f})")
-        print(f"  Top-quartile overlap ratio: {overlap_ratio:.2f}")
-        print(f"  Expected: overlap >= 0.3   →  {status}")
-        results.append(("Test 4 — Hard case flagging", overlap_ratio >= 0.3))
-
-    except FileNotFoundError:
-        print("  ⚠️  mmlu_pro_hard_sample_50.json not found — run Task 1 first.")
-        results.append(("Test 4 — Hard case flagging", False))
-
-    # ── Summary ───────────────────────────────────────────────────────────────
     print("\n" + "=" * 60)
-    print("UNIT TEST SUMMARY")
-    print("=" * 60)
-    passed = sum(1 for _, ok in results if ok)
+    passed = sum(ok for _, ok in results)
     for name, ok in results:
-        print(f"  {'✅' if ok else '❌'}  {name}")
+        print(f"  {'PASS' if ok else 'FAIL'}  {name}")
     print(f"\n{passed}/{len(results)} tests passed.")
-
-    if passed == len(results):
-        print("\n✅ All tests passed. Safe to proceed to Task 3.")
-    else:
-        print("\n❌ Some tests failed. Do NOT proceed until all pass.")
-
     return passed == len(results)
 
 
-# ── Main ──────────────────────────────────────────────────────────────────────
-
 if __name__ == "__main__":
     all_passed = run_unit_tests()
-
-    # Quick demo: score one example question
-    print("\n" + "=" * 60)
-    print("DEMO — Score a single question")
-    print("=" * 60)
-    scorer = DisagreementScorer(threshold=0.5)
-    demo_outputs = [
-        AgentOutput("R", "The integral of x^2 is x^3/3 plus a constant.", 0.85),
-        AgentOutput("D", "Using integration rules, the answer would be x^3 divided by 3.", 0.60),
-        AgentOutput("C", "I am not certain but it might be related to polynomial integration.", 0.30),
-    ]
-    result = scorer.score("demo_1", "What is the integral of x squared?", demo_outputs)
-    print(f"  D_semantic:   {result.d_semantic}")
-    print(f"  D_confidence: {result.d_confidence}")
-    print(f"  D(q):         {result.d_score}")
-    print(f"  Hard case:    {result.is_hard_case}")
+    raise SystemExit(0 if all_passed else 1)
