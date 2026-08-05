@@ -9,15 +9,19 @@ Run this on Kaggle GPU after adding these Kaggle inputs:
   5. This project/data folder, or at least mmlu_pro_hard_subset.csv/json
 
 Example Kaggle command:
-  !python /kaggle/working/Experiment_zero_hetero.py --limit 50
+  !python /kaggle/working/Experiment_zero_hetero.py \
+      --split_manifest /kaggle/input/rebuttal-split/mmlu_pro_hard_split_manifest.csv \
+      --eval_split validation --limit 50
 
 Full run:
-  !python /kaggle/working/Experiment_zero_hetero.py
+  !python /kaggle/working/Experiment_zero_hetero.py \
+      --split_manifest /kaggle/input/rebuttal-split/mmlu_pro_hard_split_manifest.csv \
+      --eval_split test
 
 Outputs:
-  /kaggle/working/exp0_heterogeneous.jsonl
-  /kaggle/working/table1_heterogeneous.csv
-  /kaggle/working/table1_heterogeneous.json
+  /kaggle/working/exp0_heterogeneous_<split>.jsonl
+  /kaggle/working/table1_heterogeneous_<split>.csv
+  /kaggle/working/table1_heterogeneous_<split>.json
 """
 
 import argparse
@@ -42,9 +46,11 @@ from transformers import AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(PROJECT_ROOT / "disagreement_scorer"))
 sys.path.insert(0, str(PROJECT_ROOT / "hard_case_buffer"))
+sys.path.insert(0, str(PROJECT_ROOT / "rebuttal"))
 
 from task2_disagreement_scorer import AgentOutput, DisagreementScorer
 from Task3_hard_case_buffer import HardCaseBuffer
+from split_guard import select_records
 
 
 LETTERS = "ABCDEFGHIJ"
@@ -352,6 +358,26 @@ def main() -> None:
     parser.add_argument("--agent_c", default=None)
     parser.add_argument("--output_dir", default="/kaggle/working")
     parser.add_argument("--work_dir", default="/kaggle/working/hetero_work")
+    parser.add_argument(
+        "--split_manifest",
+        default=str(
+            PROJECT_ROOT
+            / "rebuttal"
+            / "splits"
+            / "mmlu_pro_hard_split_manifest.csv"
+        ),
+        help="Immutable question_id/split CSV. Evaluation is fail-closed.",
+    )
+    parser.add_argument(
+        "--split_manifest_sha256",
+        default=os.environ.get("SPLIT_MANIFEST_SHA256"),
+    )
+    parser.add_argument(
+        "--eval_split",
+        choices=["validation", "test"],
+        default="validation",
+        help="Use validation while developing; use test once for final reporting.",
+    )
     parser.add_argument("--limit", type=int, default=None)
     parser.add_argument("--threshold", type=float, default=0.5)
     parser.add_argument("--max_memory_gb", type=int, default=14)
@@ -402,8 +428,19 @@ def main() -> None:
     print("Agent D   :", agent_d)
     print("Agent C   :", agent_c)
 
-    questions = load_questions(data_path, args.limit)
-    print(f"Questions : {len(questions)}")
+    questions = load_questions(data_path, None)
+    questions, split_report = select_records(
+        questions,
+        args.split_manifest,
+        {args.eval_split},
+        expected_sha256=args.split_manifest_sha256,
+    )
+    if args.limit:
+        questions = questions[: args.limit]
+    print(
+        f"Questions : {len(questions)} ({args.eval_split}; "
+        f"manifest {split_report['manifest_sha256'][:12]})"
+    )
 
     tokenizer = AutoTokenizer.from_pretrained(base_model, trust_remote_code=True)
     tokenizer.pad_token = tokenizer.eos_token
@@ -440,7 +477,7 @@ def main() -> None:
     temperatures = {"R": 1.0, "D": 1.0, "C": load_temperature(agent_c)}
     print("Temperatures:", temperatures)
 
-    output_path = output_dir / "exp0_heterogeneous.jsonl"
+    output_path = output_dir / f"exp0_heterogeneous_{args.eval_split}.jsonl"
     done = load_done(output_path)
     if done:
         print(f"Resuming: {len(done)} questions already written.")
@@ -480,6 +517,7 @@ def main() -> None:
 
             record = {
                 "question_id": qid,
+                "protocol_split": question["protocol_split"],
                 "category": question["category"],
                 "difficulty_score": question["difficulty_score"],
                 "correct_answer": question["answer"],
@@ -510,6 +548,8 @@ def main() -> None:
 
     table = {
         "run": "heterogeneous_agent_r_d_c",
+        "evaluation_split": args.eval_split,
+        "split_manifest_sha256": split_report["manifest_sha256"],
         "n_questions": int(len(df)),
         "n_scored": int(len(clean)),
         "spearman_rho_Dq_vs_difficulty": None
@@ -529,18 +569,18 @@ def main() -> None:
         ),
     }
 
-    pd.DataFrame([table]).to_csv(
-        output_dir / "table1_heterogeneous.csv", index=False
-    )
-    (output_dir / "table1_heterogeneous.json").write_text(
+    csv_path = output_dir / f"table1_heterogeneous_{args.eval_split}.csv"
+    json_path = output_dir / f"table1_heterogeneous_{args.eval_split}.json"
+    pd.DataFrame([table]).to_csv(csv_path, index=False)
+    json_path.write_text(
         json.dumps(table, indent=2), encoding="utf-8"
     )
 
     print("\nTABLE 1 HETEROGENEOUS ROW")
     print(json.dumps(table, indent=2))
     print(f"\nWrote: {output_path}")
-    print(f"Wrote: {output_dir / 'table1_heterogeneous.csv'}")
-    print(f"Wrote: {output_dir / 'table1_heterogeneous.json'}")
+    print(f"Wrote: {csv_path}")
+    print(f"Wrote: {json_path}")
     print(f"Buffer stats: {buffer.stats()}")
 
 

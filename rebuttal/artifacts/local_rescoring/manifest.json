@@ -1,0 +1,38 @@
+[
+  {
+    "input": "experiments/experiment_0/results/exp0_heterogeneous.jsonl",
+    "output": "rebuttal/artifacts/local_rescoring/exp0_heterogeneous_canonical_rescored.csv",
+    "input_rows": 50,
+    "scored_rows": 50
+  },
+  {
+    "input": "experiments/experiment_0/results/exp0_heterogeneous_mistral_d.jsonl",
+    "output": "rebuttal/artifacts/local_rescoring/exp0_heterogeneous_mistral_d_canonical_rescored.csv",
+    "input_rows": 300,
+    "scored_rows": 300
+  },
+  {
+    "input": "experiments/experiment_0/results/exp0_heterogeneous_mistral_d_n300.jsonl",
+    "output": "rebuttal/artifacts/local_rescoring/exp0_heterogeneous_mistral_d_n300_canonical_rescored.csv",
+    "input_rows": 300,
+    "scored_rows": 300
+  },
+  {
+    "input": "experiments/experiment_0/results/exp0_heterogeneous_mistral_d_n50.jsonl",
+    "output": "rebuttal/artifacts/local_rescoring/exp0_heterogeneous_mistral_d_n50_canonical_rescored.csv",
+    "input_rows": 50,
+    "scored_rows": 50
+  },
+  {
+    "input": "experiments/experiment_0/results/exp0_homogeneous.jsonl",
+    "output": "rebuttal/artifacts/local_rescoring/exp0_homogeneous_canonical_rescored.csv",
+    "input_rows": 109,
+    "scored_rows": 109
+  },
+  {
+    "input": "experiments/experiment_0/results/exp0_homogeneous_nvidia_300.jsonl",
+    "output": "rebuttal/artifacts/local_rescoring/exp0_homogeneous_nvidia_300_canonical_rescored.csv",
+    "input_rows": 300,
+    "scored_rows": 300
+  }
+]

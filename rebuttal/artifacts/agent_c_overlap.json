@@ -1,0 +1,19 @@
+{
+  "source_rows": 3016,
+  "agent_c_selected_rows": 2500,
+  "agent_c_training_rows": 2125,
+  "agent_c_validation_rows": 375,
+  "agent_c_excluded_rows": 516,
+  "evaluation_rows": 300,
+  "evaluation_in_agent_c_training": 202,
+  "evaluation_in_agent_c_validation": 38,
+  "evaluation_excluded_from_agent_c": 60,
+  "evaluation_overlap_rate_any_agent_c_split": 0.8,
+  "assumptions": {
+    "agent_c_profile": "deadline",
+    "max_rows": 2500,
+    "validation_fraction": 0.15,
+    "seed": 42,
+    "evaluation_selection": "first 300 rows in hard-subset order"
+  }
+}

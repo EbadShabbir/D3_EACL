@@ -11,6 +11,7 @@ Fast local smoke test:
 Kaggle style:
     python task10_coevolution_loop.py \
         --exp0_jsonl /kaggle/working/exp0_heterogeneous.jsonl \
+        --split_manifest /kaggle/input/rebuttal-split/mmlu_pro_hard_split_manifest.csv \
         --output_dir /kaggle/working/coevolution \
         --max_iterations 5
 """
@@ -29,6 +30,7 @@ from typing import Dict, Iterable, List, Optional, Tuple
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(PROJECT_ROOT / "hard_case_buffer"))
 sys.path.insert(0, str(PROJECT_ROOT / "diversity_regularizer"))
+sys.path.insert(0, str(PROJECT_ROOT / "rebuttal"))
 
 try:
     from Task3_hard_case_buffer import AgentOutput, DisagreementResult, HardCaseBuffer
@@ -100,6 +102,7 @@ except ModuleNotFoundError:
         def __len__(self):
             return len(self.buffer)
 from task11_diversity_regularizer import DiversityRegularizer
+from split_guard import select_records
 
 
 LETTERS = "ABCDEFGHIJ"
@@ -121,6 +124,21 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--output_dir",
         default=str(PROJECT_ROOT / "co_evolution" / "outputs"),
+    )
+    parser.add_argument(
+        "--split_manifest",
+        default=str(
+            PROJECT_ROOT
+            / "rebuttal"
+            / "splits"
+            / "mmlu_pro_hard_split_manifest.csv"
+        ),
+        help="Immutable question_id/split CSV. Co-evolution accepts train rows only.",
+    )
+    parser.add_argument(
+        "--split_manifest_sha256",
+        default=os.environ.get("SPLIT_MANIFEST_SHA256"),
+        help="Optional expected manifest digest; mismatch aborts before batch creation.",
     )
     parser.add_argument("--max_iterations", type=int, default=5)
     parser.add_argument("--sample_size", type=int, default=200)
@@ -324,6 +342,18 @@ def main() -> None:
         print(f"No Experiment 0 rows found. Wrote {demo_path}")
         return
 
+    rows, split_report = select_records(
+        rows,
+        args.split_manifest,
+        {"train"},
+        expected_sha256=args.split_manifest_sha256,
+    )
+    print(
+        "Strict split: "
+        f"{split_report['selected_rows']} training rows selected from "
+        f"{split_report['input_rows']} input rows"
+    )
+
     manifests = []
     for iteration in range(args.max_iterations):
         buffer = rebuild_buffer(rows, args)
@@ -336,6 +366,7 @@ def main() -> None:
         manifest = {
             "iteration": iteration,
             "input_rows": len(rows),
+            "split_protocol": split_report,
             "buffer_stats": buffer.stats(),
             "batch_paths": {k: str(v) for k, v in batch_paths.items()},
             "updates": updates,
@@ -345,7 +376,10 @@ def main() -> None:
         manifests.append(str(manifest_path))
         print(f"Iteration {iteration}: wrote {manifest_path}")
 
-    write_manifest(output_dir / "coevolution_summary.json", {"manifests": manifests})
+    write_manifest(
+        output_dir / "coevolution_summary.json",
+        {"split_protocol": split_report, "manifests": manifests},
+    )
 
 
 if __name__ == "__main__":

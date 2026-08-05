@@ -14,12 +14,14 @@ Kaggle example:
       --agent_c /kaggle/input/agent-c/results.zip \
       --agent_d /kaggle/input/agent-d-mistral/agent_d_mistral7b_v0.zip \
       --mmlu_path /kaggle/input/mmlu/mmlu_pro_hard_subset.csv \
+      --split_manifest /kaggle/input/rebuttal-split/mmlu_pro_hard_split_manifest.csv \
+      --eval_split validation \
       --limit 50
 
 Outputs:
-  /kaggle/working/exp0_heterogeneous_mistral_d.jsonl
-  /kaggle/working/table1_heterogeneous_mistral_d.csv
-  /kaggle/working/table1_heterogeneous_mistral_d.json
+  /kaggle/working/exp0_heterogeneous_mistral_d_<split>.jsonl
+  /kaggle/working/table1_heterogeneous_mistral_d_<split>.csv
+  /kaggle/working/table1_heterogeneous_mistral_d_<split>.json
 """
 
 import argparse
@@ -44,6 +46,7 @@ PROJECT_ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(PROJECT_ROOT / "experiments" / "experiment_0"))
 sys.path.insert(0, str(PROJECT_ROOT / "disagreement_scorer"))
 sys.path.insert(0, str(PROJECT_ROOT / "hard_case_buffer"))
+sys.path.insert(0, str(PROJECT_ROOT / "rebuttal"))
 
 from Experiment_zero_hetero import (  # noqa: E402
     AgentOutput,
@@ -58,6 +61,7 @@ from Experiment_zero_hetero import (  # noqa: E402
     majority_vote,
     score_one,
 )
+from split_guard import select_records  # noqa: E402
 
 
 def existing_dir(path: Optional[str]) -> Optional[str]:
@@ -201,6 +205,26 @@ def main() -> None:
     parser.add_argument("--agent_d_base_only", action="store_true")
     parser.add_argument("--output_dir", default="/kaggle/working")
     parser.add_argument("--work_dir", default="/kaggle/working/hetero_mistral_d_work")
+    parser.add_argument(
+        "--split_manifest",
+        default=str(
+            PROJECT_ROOT
+            / "rebuttal"
+            / "splits"
+            / "mmlu_pro_hard_split_manifest.csv"
+        ),
+        help="Immutable question_id/split CSV. Evaluation is fail-closed.",
+    )
+    parser.add_argument(
+        "--split_manifest_sha256",
+        default=os.environ.get("SPLIT_MANIFEST_SHA256"),
+    )
+    parser.add_argument(
+        "--eval_split",
+        choices=["validation", "test"],
+        default="validation",
+        help="Use validation while developing; use test once for final reporting.",
+    )
     parser.add_argument("--limit", type=int, default=None)
     parser.add_argument("--threshold", type=float, default=0.5)
     parser.add_argument("--qwen_max_memory_gb", type=int, default=5)
@@ -245,8 +269,19 @@ def main() -> None:
     print("Agent C       :", agent_c)
     print("Agent D       :", agent_d if agent_d else "base-only Mistral")
 
-    questions = load_questions(data_path, args.limit)
-    print(f"Questions     : {len(questions)}")
+    questions = load_questions(data_path, None)
+    questions, split_report = select_records(
+        questions,
+        args.split_manifest,
+        {args.eval_split},
+        expected_sha256=args.split_manifest_sha256,
+    )
+    if args.limit:
+        questions = questions[: args.limit]
+    print(
+        f"Questions     : {len(questions)} ({args.eval_split}; "
+        f"manifest {split_report['manifest_sha256'][:12]})"
+    )
 
     qwen_model, qwen_tokenizer = load_quantized_model(
         qwen_base, args.qwen_max_memory_gb, agent_r, "R"
@@ -260,7 +295,9 @@ def main() -> None:
     temperatures = {"R": 1.0, "D": load_temperature(agent_d) if agent_d else 1.0, "C": load_temperature(agent_c)}
     print("Temperatures  :", temperatures)
 
-    output_path = output_dir / "exp0_heterogeneous_mistral_d.jsonl"
+    output_path = (
+        output_dir / f"exp0_heterogeneous_mistral_d_{args.eval_split}.jsonl"
+    )
     done = load_done(output_path)
     if done:
         print(f"Resuming: {len(done)} questions already written.")
@@ -306,6 +343,7 @@ def main() -> None:
 
             record = {
                 "question_id": qid,
+                "protocol_split": question["protocol_split"],
                 "category": question["category"],
                 "difficulty_score": question["difficulty_score"],
                 "correct_answer": question["answer"],
@@ -332,6 +370,8 @@ def main() -> None:
 
     table = {
         "run": "heterogeneous_qwen_r_c_mistral_d",
+        "evaluation_split": args.eval_split,
+        "split_manifest_sha256": split_report["manifest_sha256"],
         "n_questions": int(len(df)),
         "n_scored": int(len(clean)),
         "spearman_rho_Dq_vs_difficulty": None if math.isnan(rho) else float(rho),
@@ -349,8 +389,12 @@ def main() -> None:
         ),
     }
 
-    csv_path = output_dir / "table1_heterogeneous_mistral_d.csv"
-    json_path = output_dir / "table1_heterogeneous_mistral_d.json"
+    csv_path = (
+        output_dir / f"table1_heterogeneous_mistral_d_{args.eval_split}.csv"
+    )
+    json_path = (
+        output_dir / f"table1_heterogeneous_mistral_d_{args.eval_split}.json"
+    )
     pd.DataFrame([table]).to_csv(csv_path, index=False)
     json_path.write_text(json.dumps(table, indent=2), encoding="utf-8")
 

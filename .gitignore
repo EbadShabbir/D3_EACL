@@ -63,6 +63,7 @@ checkpoints/
 # Generated documents and private local material
 *.docx
 *.pdf
+/rebuttal/docx_qa*/
 
 # Unrelated local portfolio project
 /portfolio/

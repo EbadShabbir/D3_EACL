@@ -7,6 +7,23 @@ and iterative hard-case training.
 This repository is an active research prototype. Reported outputs are
 experimental artifacts, not production guarantees.
 
+## NeurIPS 2026 rebuttal
+
+The numbered rebuttal workflow, dependencies, evidence rules, and completion
+checklists are maintained in [`rebuttal/README.md`](rebuttal/README.md).
+The cluster execution plan is in
+[`rebuttal/A100_RUNBOOK.md`](rebuttal/A100_RUNBOOK.md).
+
+Current execution order:
+
+1. Task 01 - repository and artifact inventory.
+2. Task 03 - data-flow, label-use, and leakage audit.
+3. Task 05 - configuration and manuscript-claim reconciliation.
+4. Tasks 07, 10, and 11 - locally reproducible difficulty, label-free, and
+   triage analyses.
+5. GPU-dependent reruns only after the original artifacts or a suitable cloud
+   environment are available.
+
 ## Repository map
 
 | Path | Purpose |

@@ -44,11 +44,13 @@ import pandas as pd
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(PROJECT_ROOT / "disagreement_scorer"))
 sys.path.insert(0, str(PROJECT_ROOT / "hard_case_buffer"))
+sys.path.insert(0, str(PROJECT_ROOT / "rebuttal"))
 
 # Importing Task 2 triggers a ~80 MB sentence-transformers model download
 # the first time, then ~20s to load. Be patient on the first run.
 from task2_disagreement_scorer import DisagreementScorer, AgentOutput
 from Task3_hard_case_buffer import HardCaseBuffer
+from split_guard import select_records
 
 
 # =====================================================================
@@ -432,7 +434,13 @@ def load_already_done() -> set:
 # =====================================================================
 # Main
 # =====================================================================
-def main(limit: Optional[int] = None, bundle_roles: bool = False):
+def main(
+    limit: Optional[int] = None,
+    bundle_roles: bool = False,
+    split_manifest: Optional[str] = None,
+    split_manifest_sha256: Optional[str] = None,
+    eval_split: str = "validation",
+):
     # ---- load MMLU-Pro hard subset (Task 1 CSV output) ---------------
     # We load from CSV not JSON because the JSON serializer wrote the
     # CAPPED `final_difficulty` values into a field named `difficulty_score`,
@@ -443,9 +451,24 @@ def main(limit: Optional[int] = None, bundle_roles: bool = False):
     # `options` column is a stringified Python list -- parse it back
     df_in["options"] = df_in["options"].apply(ast.literal_eval)
     questions = df_in.to_dict(orient="records")
+    questions, split_report = select_records(
+        questions,
+        split_manifest
+        or (
+            PROJECT_ROOT
+            / "rebuttal"
+            / "splits"
+            / "mmlu_pro_hard_split_manifest.csv"
+        ),
+        {eval_split},
+        expected_sha256=split_manifest_sha256,
+    )
     if limit:
         questions = questions[:limit]
-    print(f"Loaded {len(questions)} questions from {DATA_PATH.name}")
+    print(
+        f"Loaded {len(questions)} {eval_split} questions from {DATA_PATH.name} "
+        f"(manifest {split_report['manifest_sha256'][:12]})"
+    )
     print(f"  difficulty_score range: "
           f"{df_in['difficulty_score'].min():.3f} -- "
           f"{df_in['difficulty_score'].max():.3f}  "
@@ -515,6 +538,7 @@ def main(limit: Optional[int] = None, bundle_roles: bool = False):
             # ---- write row -----------------------------------------------
             rec = {
                 "question_id":      qid,
+                "protocol_split":   q["protocol_split"],
                 "category":         q.get("category"),
                 "difficulty_score": q.get("difficulty_score"),
                 "correct_answer":   q.get("answer"),      # letter
@@ -611,14 +635,47 @@ if __name__ == "__main__":
         help="Write/read resume JSONL at this path.",
     )
     parser.add_argument(
+        "--split-manifest",
+        default=str(
+            PROJECT_ROOT
+            / "rebuttal"
+            / "splits"
+            / "mmlu_pro_hard_split_manifest.csv"
+        ),
+        help="Immutable question_id/split CSV. Evaluation is fail-closed.",
+    )
+    parser.add_argument(
+        "--split-manifest-sha256",
+        default=os.environ.get("SPLIT_MANIFEST_SHA256"),
+    )
+    parser.add_argument(
+        "--eval-split",
+        choices=["validation", "test"],
+        default="validation",
+        help="Use validation while developing; use test once for final reporting.",
+    )
+    parser.add_argument(
         "--limit", type=int, default=None,
         help="Run on first N questions only (use --limit 10 for smoke test)",
     )
     args = parser.parse_args()
-    configure_output_paths(args.results_path)
+    default_results_path = (
+        PROJECT_ROOT
+        / "experiments"
+        / "experiment_0"
+        / "results"
+        / f"exp0_homogeneous_{args.eval_split}.jsonl"
+    )
+    configure_output_paths(args.results_path or str(default_results_path))
     configure_backend(
         backend=args.backend,
         model=args.model,
         min_interval=args.min_interval,
     )
-    main(limit=args.limit, bundle_roles=args.bundle_roles)
+    main(
+        limit=args.limit,
+        bundle_roles=args.bundle_roles,
+        split_manifest=args.split_manifest,
+        split_manifest_sha256=args.split_manifest_sha256,
+        eval_split=args.eval_split,
+    )

@@ -15,7 +15,8 @@ Post-training:
 
 Recommended Kaggle command:
   !CUDA_VISIBLE_DEVICES=0 python /kaggle/working/agent_c_calibration_fast.py \
-      --mmlu_json /kaggle/input/YOUR_DATASET/mmlu_pro_hard_subset.json
+      --mmlu_json /kaggle/input/YOUR_DATASET/mmlu_pro_hard_subset.json \
+      --split_manifest /kaggle/input/REBUTTAL_SPLIT/mmlu_pro_hard_split_manifest.csv
 
 Expected output:
   /kaggle/working/agent_c_v0
@@ -31,9 +32,21 @@ import inspect
 import json
 import os
 import random
+import sys
 import time
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
+
+
+PROJECT_ROOT = Path(__file__).resolve().parents[2]
+for helper_dir in (
+    Path(__file__).resolve().parent,
+    PROJECT_ROOT / "rebuttal",
+    Path.cwd() / "rebuttal",
+):
+    sys.path.insert(0, str(helper_dir))
+
+from split_guard import assert_disjoint_question_ids, select_records
 
 
 REQUIRED_MODULES = [
@@ -93,6 +106,20 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--mmlu_json", default=os.environ.get("MMLU_JSON"))
     parser.add_argument("--mmlu_csv", default=os.environ.get("MMLU_CSV"))
     parser.add_argument("--hf_split", default="test")
+    parser.add_argument(
+        "--split_manifest",
+        default=os.environ.get("SPLIT_MANIFEST"),
+        help="Immutable question_id/split CSV used instead of a random split.",
+    )
+    parser.add_argument(
+        "--split_manifest_sha256",
+        default=os.environ.get("SPLIT_MANIFEST_SHA256"),
+    )
+    parser.add_argument(
+        "--allow_legacy_random_split",
+        action="store_true",
+        help="Explicit escape hatch for old runs; not valid for rebuttal evidence.",
+    )
 
     parser.add_argument("--max_rows", type=int, default=None)
     parser.add_argument("--val_fraction", type=float, default=0.15)
@@ -191,6 +218,28 @@ def find_mmlu_file() -> Optional[str]:
     for candidate in candidates:
         if os.path.exists(candidate):
             return candidate
+    return None
+
+
+def find_split_manifest() -> Optional[str]:
+    candidates = [
+        ARGS.split_manifest,
+        str(
+            PROJECT_ROOT
+            / "rebuttal"
+            / "splits"
+            / "mmlu_pro_hard_split_manifest.csv"
+        ),
+        str(Path.cwd() / "rebuttal" / "splits" / "mmlu_pro_hard_split_manifest.csv"),
+        str(Path.cwd() / "mmlu_pro_hard_split_manifest.csv"),
+        *glob.glob(
+            "/kaggle/input/**/mmlu_pro_hard_split_manifest.csv",
+            recursive=True,
+        ),
+    ]
+    for candidate in candidates:
+        if candidate and Path(candidate).is_file():
+            return str(Path(candidate))
     return None
 
 
@@ -302,19 +351,66 @@ def load_mmlu_records() -> Tuple[List[Dict], str]:
     if not records:
         raise ValueError("No usable MMLU-Pro records found.")
 
-    rng = random.Random(ARGS.seed)
-    rng.shuffle(records)
-    if ARGS.max_rows and len(records) > ARGS.max_rows:
-        records = records[: ARGS.max_rows]
     return records, source
 
 
-def split_records(records: List[Dict]) -> Tuple[List[Dict], List[Dict]]:
+def split_records(records: List[Dict]) -> Tuple[List[Dict], List[Dict], Dict]:
     if len(records) < 20:
         raise ValueError("Need at least 20 records so Agent-C can fit a validation temperature.")
-    n_val = max(32, int(round(len(records) * ARGS.val_fraction)))
-    n_val = min(n_val, max(1, len(records) // 3))
-    return records[n_val:], records[:n_val]
+
+    manifest_path = find_split_manifest()
+    if manifest_path:
+        train_records, train_report = select_records(
+            records,
+            manifest_path,
+            {"train"},
+            expected_sha256=ARGS.split_manifest_sha256,
+        )
+        val_records, validation_report = select_records(
+            records,
+            manifest_path,
+            {"validation"},
+            expected_sha256=ARGS.split_manifest_sha256,
+        )
+        assert_disjoint_question_ids(
+            {"agent_c_train": train_records, "agent_c_validation": val_records}
+        )
+        random.Random(ARGS.seed).shuffle(train_records)
+        if ARGS.max_rows and len(train_records) > ARGS.max_rows:
+            train_records = train_records[: ARGS.max_rows]
+        split_report = {
+            "mode": "strict_manifest",
+            "manifest": train_report["manifest"],
+            "manifest_sha256": train_report["manifest_sha256"],
+            "train_rows": len(train_records),
+            "validation_rows": len(val_records),
+            "train_selection": train_report,
+            "validation_selection": validation_report,
+        }
+        return train_records, val_records, split_report
+
+    if not ARGS.allow_legacy_random_split:
+        raise FileNotFoundError(
+            "No split manifest found. Pass --split_manifest; use "
+            "--allow_legacy_random_split only for non-rebuttal legacy runs."
+        )
+
+    shuffled = list(records)
+    random.Random(ARGS.seed).shuffle(shuffled)
+    if ARGS.max_rows and len(shuffled) > ARGS.max_rows:
+        shuffled = shuffled[: ARGS.max_rows]
+    n_val = max(32, int(round(len(shuffled) * ARGS.val_fraction)))
+    n_val = min(n_val, max(1, len(shuffled) // 3))
+    return (
+        shuffled[n_val:],
+        shuffled[:n_val],
+        {
+            "mode": "legacy_random_split_not_for_rebuttal",
+            "seed": ARGS.seed,
+            "train_rows": len(shuffled) - n_val,
+            "validation_rows": n_val,
+        },
+    )
 
 
 def format_prompt(tokenizer, record: Dict) -> str:
@@ -642,7 +738,7 @@ def main() -> None:
     output_dir.mkdir(parents=True, exist_ok=True)
 
     records, data_source = load_mmlu_records()
-    train_records, val_records = split_records(records)
+    train_records, val_records, split_report = split_records(records)
 
     if torch.cuda.is_available():
         torch.cuda.set_device(LOCAL_RANK)
@@ -663,6 +759,9 @@ def main() -> None:
     log("=" * 72)
     log(f"Model path       : {model_path}")
     log(f"Data source      : {data_source}")
+    log(f"Split mode       : {split_report['mode']}")
+    if split_report.get("manifest_sha256"):
+        log(f"Split manifest   : {split_report['manifest_sha256']}")
     log(f"Output dir       : {output_dir}")
     log(f"Profile          : {ARGS.profile}")
     log(f"World size       : {WORLD_SIZE}")
@@ -785,6 +884,7 @@ def main() -> None:
             "checkpoint_name": "Agent-C-v0",
             "base_model": model_path,
             "data_source": data_source,
+            "split_protocol": split_report,
             "profile": ARGS.profile,
             "training": {
                 "train_rows": len(train_records),
